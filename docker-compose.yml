@@ -1,0 +1,48 @@
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: smokeeat
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"   # opcional, para conectarte desde host
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - db_data:/var/lib/mysql
+
+  adminer:
+    image: adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: mysql://app:app@db:3306/smokeeat
+      # IG auto-reply (si lo usás)
+      VERIFY_TOKEN: change_this_verify_token
+      PAGE_TOKEN: EAAX...your_page_access_token
+      IG_ID: 1784...your_ig_business_id
+      TIMEZONE: America/Argentina/Buenos_Aires
+      OPEN_DAYS: "2,3,4,5,6,7"
+      OPEN_START: "20:00"
+      OPEN_END: "00:30"
+      ORDER_URL: "https://smokeeatburger.com/menu"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
