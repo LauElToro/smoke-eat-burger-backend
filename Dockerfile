@@ -1,21 +1,25 @@
 FROM node:20-bullseye AS builder
 WORKDIR /app
 
-# Instalar deps respetando lockfile si existe
+# Instalar deps (respeta el lock si existe)
 COPY package.json package-lock.json* ./
 RUN bash -lc 'if [ -f package-lock.json ]; then npm ci; else npm install; fi'
 
-# Copiar código fuente
+# Copiar código
 COPY . .
 
-# Asegurar carpeta public/ para evitar fallos de COPY posteriores
+# Asegurar carpeta public/ para evitar fallos de COPY en runtime
 RUN test -d public || mkdir public
 
-# Generar Prisma Client y build de Next (standalone)
+# Prisma Client + build de Next (standalone)
 RUN npx prisma generate && npm run build
 
+# Empaquetar opcionales (si existen) para poder copiarlos después
+RUN mkdir -p /opt/optional-config \
+ && [ -f tsconfig.json ] && cp tsconfig.json /opt/optional-config/ || true \
+ && [ -f jsconfig.json ] && cp jsconfig.json /opt/optional-config/ || true
 
-# ========= Runtime =========
+# ========= Runtime / Test Runner =========
 FROM node:20-bullseye AS runner
 WORKDIR /app
 ENV NODE_ENV=production
@@ -24,24 +28,31 @@ ENV NODE_ENV=production
 RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
   && rm -rf /var/lib/apt/lists/*
 
-# Prisma CLI global (evita problemas de módulos faltantes en runtime)
+# Prisma CLI global (para ci:db)
 RUN npm i -g prisma@6.15.0
 
-# Artefactos de Next (standalone) y estáticos
+# Artefactos de Next
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
-# Config de tests (para alias "@", etc.)
+# Config de Vitest
 COPY --from=builder /app/vitest.config.mjs ./
 
-# Prisma (schema + engines) y bcryptjs para seed
+# Copiar opcionales si los había
+COPY --from=builder /opt/optional-config/ ./
+
+# Prisma (schema + engines) y libs usadas por seed/tests
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=builder /app/node_modules/bcryptjs ./node_modules/bcryptjs
 
-# Código necesario para tests/endpoints
+# *** deps que faltaban en tests ***
+COPY --from=builder /app/node_modules/decimal.js ./node_modules/decimal.js
+COPY --from=builder /app/node_modules/luxon ./node_modules/luxon
+
+# Código fuente que usan los tests
 COPY --from=builder /app/tests ./tests
 COPY --from=builder /app/app ./app
 COPY --from=builder /app/lib ./lib
