@@ -1,0 +1,287 @@
+openapi: 3.0.3
+info:
+  title: SmokeEat Backend v4 API
+  version: "1.0.0"
+  description: |
+    API de ejemplo para órdenes, inventario y webhooks (pagos e Instagram).
+    - Todas las cifras monetarias se envían/devuelven como **enteros** en la unidad mínima (p. ej. **centavos**).
+    - Los esquemas pueden exponer **gross** *o* **grossProfit** según la migración de base activa.
+
+servers:
+  - url: http://localhost:3000
+    description: Local (Docker)
+
+tags:
+  - name: Orders
+  - name: Payments
+  - name: Inventory
+  - name: Instagram
+
+paths:
+  /api/orders:
+    post:
+      tags: [Orders]
+      summary: Crea una orden PENDING
+      description: |
+        Crea una orden con sus renglones a partir de SKUs. El precio unitario se toma del ítem de catálogo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              simple:
+                value:
+                  items:
+                    - sku: BURGER-CHS-S
+                      qty: 2
+      responses:
+        "200":
+          description: Orden creada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        "400":
+          description: Parámetros inválidos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "500":
+          description: Error interno
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/webhooks/payments:
+    get:
+      tags: [Payments]
+      summary: Webhook de pagos (modo dev)
+      description: |
+        Endpoint simulado para aprobar pagos.
+        - En tests se usa `status=approved` y `orderId={id}`.
+        - Si `consumeForOrder` no está disponible, se calcula COGS desde el BOM (agrupado para evitar duplicados).
+      parameters:
+        - in: query
+          name: status
+          required: true
+          schema:
+            type: string
+            enum: [approved, pending, failed]
+          description: Estado recibido del proveedor (dev).
+        - in: query
+          name: orderId
+          required: true
+          schema:
+            type: integer
+          description: ID de la orden a actualizar.
+      responses:
+        "200":
+          description: Orden actualizada a PAID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        "400":
+          description: Parámetros inválidos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "404":
+          description: Orden no encontrada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "500":
+          description: Error interno
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/inventory/low-stock:
+    get:
+      tags: [Inventory]
+      summary: Lista de ítems bajo punto de reposición
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LowStockResponse'
+              examples:
+                example:
+                  value:
+                    lowStock:
+                      - sku: PAN
+                        name: Pan de papa
+                        soh: 10
+                        reorderPoint: 20
+                        unit: un
+        "500":
+          description: Error interno
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/ig/webhook:
+    get:
+      tags: [Instagram]
+      summary: Verificación webhook IG
+      description: Responde el `hub.challenge` para validar el webhook (suscripción IG).
+      parameters:
+        - in: query
+          name: "hub.mode"
+          schema: { type: string }
+        - in: query
+          name: "hub.challenge"
+          schema: { type: string }
+        - in: query
+          name: "hub.verify_token"
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK (texto plano con `hub.challenge`)
+          content:
+            text/plain:
+              schema: { type: string }
+        "403":
+          description: verify_token inválido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    post:
+      tags: [Instagram]
+      summary: Recepción webhook IG
+      description: Recibe eventos de IG y ejecuta lógica (marcar visto, responder, etc.).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+            examples:
+              sample:
+                value:
+                  object: instagram
+                  entry:
+                    - id: "123"
+                      time: 1716240000
+                      messaging:
+                        - sender: { id: "u_1" }
+                          recipient: { id: "page_1" }
+                          timestamp: 1716240001
+                          message: { text: "hola!" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "500":
+          description: Error interno
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [sku, qty]
+            properties:
+              sku:
+                type: string
+                description: SKU del producto terminado (p. ej. BURGER-CHS-S)
+              qty:
+                type: integer
+                minimum: 1
+                description: Cantidad solicitada
+
+    OrderResponse:
+      type: object
+      properties:
+        order:
+          $ref: '#/components/schemas/Order'
+
+    Order:
+      type: object
+      description: |
+        Orden con totales en enteros (centavos).
+        **Nota**: el campo de rentabilidad puede aparecer como `gross` **o** `grossProfit`.
+      properties:
+        id: { type: integer }
+        status:
+          type: string
+          enum: [PENDING, PAID, CANCELLED]
+        subtotal:
+          type: integer
+          description: Subtotal sin descuentos/impuestos (centavos)
+        total:
+          type: integer
+          description: Total final (centavos)
+        cogs:
+          type: integer
+          description: Costo de la mercadería vendida (centavos)
+        gross:
+          type: integer
+          nullable: true
+          description: Ganancia bruta (centavos). Presente si la columna `gross` existe.
+        grossProfit:
+          type: integer
+          nullable: true
+          description: Ganancia bruta (centavos). Presente si **no** existe `gross`.
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        createdAt:
+          type: string
+          format: date-time
+
+    OrderItem:
+      type: object
+      properties:
+        id: { type: integer }
+        orderId: { type: integer }
+        itemId: { type: integer }
+        qty:
+          type: integer
+          minimum: 1
+        unitPrice:
+          type: integer
+          description: Precio unitario (centavos)
+        lineTotal:
+          type: integer
+          description: Total de la línea (centavos)
+
+    LowStockResponse:
+      type: object
+      properties:
+        lowStock:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              name: { type: string }
+              soh:
+                type: integer
+                description: Stock on hand (suma de batches)
+              reorderPoint: { type: integer }
+              unit: { type: string }
+
+    Error:
+      type: object
+      properties:
+        error: { type: string }
