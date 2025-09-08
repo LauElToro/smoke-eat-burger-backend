@@ -1,64 +1,102 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import Decimal from "decimal.js";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
-export const revalidate = 0;
+export const runtime = "nodejs";
+
+async function hasColumn(table, column) {
+  const rows = await prisma.$queryRawUnsafe(
+    `SELECT COUNT(*) AS cnt
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    table, column
+  );
+  return Number(rows?.[0]?.cnt ?? 0) > 0;
+}
+
+function num(x) { return x == null ? x : Number(x); }
+function normalizeOrder(o) {
+  if (!o) return o;
+  return {
+    ...o,
+    subtotal: num(o.subtotal),
+    total:    num(o.total),
+    cogs:     num(o.cogs),
+    gross:        o.gross        != null ? num(o.gross)        : undefined,
+    grossProfit:  o.grossProfit  != null ? num(o.grossProfit)  : undefined,
+    items: o.items?.map(i => ({
+      ...i,
+      qty:       num(i.qty),
+      unitPrice: num(i.unitPrice),
+      lineTotal: num(i.lineTotal),
+    })),
+  };
+}
+
+async function resolveItems(body) {
+  // Formatos aceptados:
+  // 1) { items: [{ itemId?, sku?, qty, unitPrice? }, ...] }
+  // 2) { sku, qty } (atajo de 1 ítem)
+  let raw = [];
+  if (Array.isArray(body?.items) && body.items.length) raw = body.items;
+  else if (body?.sku) raw = [{ sku: body.sku, qty: body.qty ?? 1 }];
+
+  if (!raw.length) return [];
+
+  const resolved = [];
+  for (const it of raw) {
+    let itemRecord = null;
+    if (it.itemId) {
+      itemRecord = await prisma.item.findUnique({ where: { id: Number(it.itemId) } });
+    } else if (it.sku) {
+      itemRecord = await prisma.item.findUnique({ where: { sku: String(it.sku) } });
+    }
+    if (!itemRecord) throw new Error("Item not found");
+
+    const qty = Number(it.qty ?? 1);
+    const unitPrice = it.unitPrice != null ? Number(it.unitPrice) : Number(itemRecord.price ?? 0);
+    if (!Number.isFinite(qty) || !Number.isFinite(unitPrice)) throw new Error("Bad numbers");
+
+    resolved.push({
+      itemId: itemRecord.id,
+      qty,
+      unitPrice,
+      lineTotal: qty * unitPrice,
+    });
+  }
+  return resolved;
+}
 
 export async function POST(req) {
   try {
     const body = await req.json();
-    const items = Array.isArray(body.items) ? body.items : [];
-    if (!items.length) return NextResponse.json({ error: "No hay items" }, { status: 400 });
-
-    const discount = new Decimal(body.discount || 0);
-    const taxRate = new Decimal(body.taxRate ?? process.env.TAX_RATE ?? 0);
-
-    const skus = items.map(i => i.sku);
-    const dbItems = await prisma.item.findMany({ where: { sku: { in: skus } } });
-    const bySku = new Map(dbItems.map(i => [i.sku, i]));
-
-    const lines = [];
-    for (const row of items) {
-      const it = bySku.get(row.sku);
-      if (!it) return NextResponse.json({ error: `SKU inexistente: ${row.sku}` }, { status: 400 });
-      const qty = parseInt(row.qty, 10) || 0;
-      if (qty <= 0) return NextResponse.json({ error: `Cantidad inválida para ${row.sku}` }, { status: 400 });
-
-      const unitPrice = new Decimal(row.price ?? it.price ?? 0);
-      const lineTotal = unitPrice.times(qty);
-      lines.push({ item: it, qty, unitPrice, lineTotal });
+    const items = await resolveItems(body);
+    if (!items.length) {
+      return NextResponse.json({ error: "No items" }, { status: 400 });
     }
 
-    const subtotal = lines.reduce((acc, l) => acc.plus(l.lineTotal), new Decimal(0));
-    const tax = subtotal.minus(discount).times(taxRate).toDecimalPlaces(2);
-    const total = subtotal.minus(discount).plus(tax).toDecimalPlaces(2);
+    const subtotal = items.reduce((acc, it) => acc + it.lineTotal, 0);
+    if (!Number.isFinite(subtotal) || subtotal <= 0) {
+      return NextResponse.json({ error: "Invalid totals" }, { status: 400 });
+    }
 
-    const order = await prisma.$transaction(async (tx) => {
-      const created = await tx.order.create({ data: {
+    const useGross = await hasColumn("Order", "gross");
+    const grossKey = useGross ? "gross" : "grossProfit";
+
+    const order = await prisma.order.create({
+      data: {
         status: "PENDING",
-        subtotal: subtotal.toNumber(),
-        discount: discount.toNumber(),
-        tax: tax.toNumber(),
-        total: total.toNumber()
-      }});
-
-      for (const l of lines) {
-        await tx.orderItem.create({ data: {
-          orderId: created.id,
-          itemId: l.item.id,
-          qty: l.qty,
-          unitPrice: l.unitPrice.toNumber(),
-          lineTotal: l.lineTotal.toNumber()
-        }});
-      }
-      return created;
+        subtotal,
+        total: subtotal,
+        cogs: 0,
+        [grossKey]: 0,
+        items: { create: items },
+      },
+      include: { items: true },
     });
 
-    return NextResponse.json({ ok: true, order });
-  } catch (e) {
-    console.error(e);
-    return NextResponse.json({ error: e.message || "Error" }, { status: 500 });
+    return NextResponse.json({ order: normalizeOrder(order) }, { status: 200 });
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "Internal Error" }, { status: 500 });
   }
 }

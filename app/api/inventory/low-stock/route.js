@@ -1,24 +1,37 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
-export const revalidate = 0;
-
+// Lista items por debajo de su reorderPoint
 export async function GET() {
-  const items = await prisma.item.findMany({
-    where: { reorderPoint: { gt: 0 } },
-    include: { batches: true }
-  });
+  try {
+    const items = await prisma.item.findMany({
+      where: { type: "INGREDIENT" },
+      select: { id: true, sku: true, name: true, reorderPoint: true },
+      orderBy: { sku: "asc" },
+    });
 
-  const data = items.map(i => ({
-    id: i.id,
-    sku: i.sku,
-    name: i.name,
-    soh: i.batches.reduce((a, b) => a + Number(b.qty), 0),
-    reorderPoint: i.reorderPoint
-  })).filter(i => i.soh <= i.reorderPoint)
-    .sort((a,b) => a.soh - b.soh);
+    // Stock on hand (SOH) por item
+    const batches = await prisma.stockBatch.groupBy({
+      by: ["itemId"],
+      _sum: { qty: true },
+      where: { itemId: { in: items.map((i) => i.id) } },
+    });
+    const soh = new Map(batches.map((b) => [b.itemId, Number(b._sum.qty || 0)]));
 
-  return NextResponse.json({ lowStock: data });
+    const lowStock = items
+      .map((i) => ({
+        id: i.id,
+        sku: i.sku,
+        name: i.name,
+        reorderPoint: i.reorderPoint,
+        qty: soh.get(i.id) || 0,
+      }))
+      .filter((i) => i.qty < i.reorderPoint)
+      .sort((a, b) => a.sku.localeCompare(b.sku));
+
+    return NextResponse.json({ lowStock });
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "Error interno" }, { status: 500 });
+  }
 }

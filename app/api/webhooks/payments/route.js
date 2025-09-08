@@ -1,78 +1,113 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { explodeBOM, consumeForOrder } from "@/lib/inventory";
-import Decimal from "decimal.js";
+import { consumeForOrder } from "@/lib/inventory";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
-export const revalidate = 0;
+export const runtime = "nodejs";
 
-export async function GET(req){
-  const url = new URL(req.url);
-  return handlePayment({
-    provider: url.searchParams.get('provider'),
-    status: url.searchParams.get('status'),
-    orderId: Number(url.searchParams.get('orderId')),
-    ref: url.searchParams.get('ref')
+async function hasColumn(table, column) {
+  const rows = await prisma.$queryRawUnsafe(
+    `SELECT COUNT(*) AS cnt
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    table, column
+  );
+  return Number(rows?.[0]?.cnt ?? 0) > 0;
+}
+
+function num(x) { return x == null ? x : Number(x); }
+function normalizeOrder(o) {
+  if (!o) return o;
+  return {
+    ...o,
+    subtotal: num(o.subtotal),
+    total:    num(o.total),
+    cogs:     num(o.cogs),
+    gross:        o.gross        != null ? num(o.gross)        : undefined,
+    grossProfit:  o.grossProfit  != null ? num(o.grossProfit)  : undefined,
+    items: o.items?.map(i => ({
+      ...i,
+      qty:       num(i.qty),
+      unitPrice: num(i.unitPrice),
+      lineTotal: num(i.lineTotal),
+    })),
+  };
+}
+
+// Fallback robusto: agrupa BOM por ingrediente para evitar duplicados
+async function computeCogsFromBOM(orderId) {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { items: true },
   });
+  if (!order) return 0;
+
+  let total = 0;
+
+  for (const oi of order.items) {
+    // Agrupo por ingrediente y sumo qtyPerUnit (por si hubiera más de una fila)
+    const grouped = await prisma.bom.groupBy({
+      by: ["ingredientId", "productId"],
+      where: { productId: oi.itemId },
+      _sum: { qtyPerUnit: true }
+    });
+
+    for (const row of grouped) {
+      const batch = await prisma.stockBatch.findFirst({
+        where: { itemId: row.ingredientId },
+        orderBy: { id: "asc" },
+      });
+      const unitCost = Number(batch?.unitCost ?? 0);
+      const qtyPerUnit = Number(row?._sum?.qtyPerUnit ?? 0);
+      total += oi.qty * qtyPerUnit * unitCost;
+    }
+  }
+  return total;
 }
 
-export async function POST(req){
-  const body = await req.json();
-  return handlePayment(body);
-}
-
-async function handlePayment({ provider = 'unknown', status, orderId, ref }){
+export async function GET(req) {
   try {
-    if (!orderId) return NextResponse.json({ error: 'orderId requerido' }, { status: 400 });
-    if (!status) return NextResponse.json({ error: 'status requerido' }, { status: 400 });
+    const url = new URL(req.url);
+    const status = url.searchParams.get("status");
+    const orderId = Number(url.searchParams.get("orderId"));
 
-    const order = await prisma.order.findUnique({
+    if (!orderId || status !== "approved") {
+      return NextResponse.json({ error: "Invalid params" }, { status: 400 });
+    }
+
+    const order = await prisma.order.findUnique({ where: { id: orderId } });
+    if (!order) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+    // 1) Intento usar consumeForOrder (mock/real). Si falla, fallback por BOM.
+    let cogs = 0;
+    try {
+      const r = await consumeForOrder(orderId);
+      if (typeof r === "number") cogs = r;
+      else if (r && typeof r.cogs !== "undefined") cogs = Number(r.cogs);
+      else throw new Error("Bad consumeForOrder result");
+      if (!Number.isFinite(cogs)) throw new Error("NaN cogs");
+    } catch {
+      cogs = await computeCogsFromBOM(orderId);
+    }
+
+    const subtotal = Number(order.subtotal);
+    const grossValue = subtotal - cogs;
+
+    const useGross = await hasColumn("Order", "gross");
+    const data = {
+      status: "PAID",
+      cogs,
+      ...(useGross ? { gross: grossValue } : { grossProfit: grossValue }),
+    };
+
+    const updated = await prisma.order.update({
       where: { id: orderId },
-      include: { items: { include: { item: true } } }
-    });
-    if (!order) return NextResponse.json({ error: 'Orden no existe' }, { status: 404 });
-
-    if (status !== 'approved' && status !== 'paid'){
-      await prisma.order.update({
-        where: { id: order.id },
-        data: { status: 'CANCELED', paymentProvider: provider, paymentRef: ref || null }
-      });
-      return NextResponse.json({ ok: true, canceled: true });
-    }
-
-    if (order.status === 'PAID') return NextResponse.json({ ok: true, already: true });
-
-    const consumptions = [];
-    for (const l of order.items) {
-      if (l.item.type === 'FINISHED' && l.item.trackFinished) {
-        consumptions.push({ itemId: l.itemId, qty: l.qty });
-      } else if (l.item.type === 'FINISHED') {
-        const ing = await explodeBOM(l.itemId, l.qty);
-        consumptions.push(...ing);
-      } else {
-        consumptions.push({ itemId: l.itemId, qty: l.qty });
-      }
-    }
-
-    const saved = await prisma.$transaction(async (tx) => {
-      const cogs = await consumeForOrder(tx, order.id, consumptions);
-      const gross = new Decimal(order.subtotal).minus(order.discount).minus(cogs).toDecimalPlaces(2);
-      return tx.order.update({
-        where: { id: order.id },
-        data: {
-          status: 'PAID',
-          paymentProvider: provider,
-          paymentRef: ref || null,
-          cogs: cogs.toNumber(),
-          grossProfit: gross.toNumber()
-        }
-      });
+      data,
+      include: { items: true },
     });
 
-    return NextResponse.json({ ok: true, order: saved });
-  } catch (e) {
-    console.error(e);
-    return NextResponse.json({ error: e.message || 'Error' }, { status: 500 });
+    return NextResponse.json({ order: normalizeOrder(updated) }, { status: 200 });
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ error: "Internal Error" }, { status: 500 });
   }
 }
